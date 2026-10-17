@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "modules": [
+    {
+      "id": "sherpa",
+      "packageName": "com.silent.runtime.sherpa",
+      "compatibilityId": "sherpa-onnx-jni-v1",
+      "versionCode": 1,
+      "versionName": "1.0.0",
+      "artifacts": [
+        {
+          "abi": "arm64-v8a",
+          "minSdk": 24,
+          "size": 23630316,
+          "sha256": "f7286136623689e9af491f04a301ee6b143265863e2b74853a842355e8c0ad55",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-sherpa-1.0.0-arm64-v8a.apk"
+        },
+        {
+          "abi": "armeabi-v7a",
+          "minSdk": 24,
+          "size": 16134638,
+          "sha256": "533f8c6f379649e1f7f6505bde174ddd0b4a45537fe0ef0ce537098542ca2bb1",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-sherpa-1.0.0-armeabi-v7a.apk"
+        }
+      ]
+    }
+  ]
+}

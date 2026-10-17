@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Build a WebHTV runtime module APK.
+
+A module APK is a minimal, signed Android package whose only payload is the native
+library (plus a ``runtime.json`` manifest describing it). The host downloads it,
+verifies the catalog digest, hands it to ``PackageInstaller``, and then loads the
+library straight out of the installed module's ``nativeLibraryDir``.
+
+Two properties of the output matter and are easy to get wrong:
+
+* ``lib/<abi>/*.so`` must be stored **uncompressed**. Android only exposes
+  ``nativeLibraryDir`` for libraries it can mmap directly; a deflated entry would
+  force extraction elsewhere and break the load path.
+* The APK must be signed. ``PackageInstaller`` rejects unsigned packages, and the
+  host cross-checks the installed package name against the catalog entry.
+
+Usage:
+    python scripts/build_module.py --abi arm64-v8a
+    python scripts/build_module.py --abi arm64-v8a --native /path/to/libsherpa-onnx-jni.so
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_WEBHTV = Path(os.environ.get("WEBHTV_DIR", "F:/Workspace/webhtv"))
+DEFAULT_SDK = Path(os.environ.get("ANDROID_SDK", "C:/Users/Maple/AppData/Local/Android/Sdk"))
+DEBUG_KEYSTORE = Path.home() / ".android" / "debug.keystore"
+
+# Manifest of each module: what it is, what it needs, and where the library comes from.
+MODULES = {
+    "sherpa": {
+        "module": "sherpa",
+        "packageName": "com.silent.runtime.sherpa",
+        "versionCode": 1,
+        "versionName": "1.0.0",
+        "compatibilityId": "sherpa-onnx-jni-v1",
+        "library": "libsherpa-onnx-jni.so",
+        # Verified with readelf: the library depends only on libandroid/liblog/libm/libdl/libc,
+        # so no host-provided shared library is involved. This is why sherpa is the pilot module.
+        "hostLibraries": {},
+    },
+}
+
+# Modules whose classes must already exist in the host APK; a module only ships .so files.
+HOST_PROVIDES_CLASSES = True
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_native_library(module: str, abi: str, webhtv: Path, explicit: Path | None) -> Path:
+    """Locate the native library to package."""
+    name = MODULES[module]["library"]
+    if explicit is not None:
+        if not explicit.is_file():
+            sys.exit(f"error: --native not found: {explicit}")
+        return explicit
+    candidates = [
+        webhtv / "app" / "src" / "main" / "jniLibs" / abi / name,
+        webhtv / "app" / "src" / "arm64_v8a" / "assets" / "mpv-libs" / abi / name,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    sys.exit(
+        f"error: could not find {name} for {abi}.\n"
+        f"looked in:\n" + "\n".join(f"  {c}" for c in candidates)
+    )
+
+
+def tool(sdk: Path, name: str) -> Path:
+    build_tools = sorted((sdk / "build-tools").glob("*"))
+    if not build_tools:
+        sys.exit(f"error: no build-tools under {sdk}")
+    for build_tool in reversed(build_tools):
+        for candidate in (build_tool / name, build_tool / f"{name}.exe", build_tool / f"{name}.bat"):
+            if candidate.is_file():
+                return candidate
+    sys.exit(f"error: {name} not found under {sdk / 'build-tools'}")
+
+
+def run(command: list[str]) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"error: {' '.join(str(c) for c in command)}\n{result.stdout}\n{result.stderr}")
+
+
+def write_manifest(dest: Path, module: str, abi: str, library_rel: str, files: list[dict]) -> None:
+    spec = MODULES[module]
+    payload = {
+        "module": spec["module"],
+        "packageName": spec["packageName"],
+        "versionCode": spec["versionCode"],
+        "versionName": spec["versionName"],
+        "compatibilityId": spec["compatibilityId"],
+        "abi": abi,
+        "library": library_rel,
+        "hostLibraries": spec["hostLibraries"],
+        "files": files,
+    }
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=False), encoding="utf-8")
+
+
+def write_android_manifest(dest: Path, module: str) -> None:
+    spec = MODULES[module]
+    # A module declares no activity and ships no dex: it exists purely to publish native
+    # libraries. ``android:hasCode="false"`` is required, otherwise the platform refuses the
+    # install with INSTALL_FAILED_INVALID_APK "code is missing".
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+        f'    package="{spec["packageName"]}"\n'
+        f'    android:versionCode="{spec["versionCode"]}"\n'
+        f'    android:versionName="{spec["versionName"]}">\n'
+        '    <application android:hasCode="false" android:extractNativeLibs="true" />\n'
+        '</manifest>\n',
+        encoding="utf-8",
+    )
+
+
+def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, native: Path | None) -> Path:
+    spec = MODULES[module]
+    source = find_native_library(module, abi, webhtv, native)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    unsigned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-unsigned.apk"
+    aligned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-aligned.apk"
+    final = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}.apk"
+
+    library_rel = f"lib/{abi}/{spec['library']}"
+    native_size = source.stat().st_size
+    native_sha = sha256_file(source)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = Path(tmp)
+        lib_dir = staging / "lib" / abi
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, lib_dir / spec["library"])
+
+        files = [{"path": library_rel, "size": native_size, "sha256": native_sha}]
+        write_manifest(staging / "assets" / "runtime.json", module, abi, library_rel, files)
+        write_android_manifest(staging / "AndroidManifest.xml", module)
+
+        aapt2 = tool(sdk, "aapt2")
+        zipalign = tool(sdk, "zipalign")
+        apksigner = tool(sdk, "apksigner")
+
+        # aapt2 links the manifest and binary XML; the payload is added afterwards so the
+        # .so entries can be forced to ZIP_STORED.
+        android_jar = sdk / "platforms" / "android-36" / "android.jar"
+        if not android_jar.is_file():
+            platforms = sorted((sdk / "platforms").glob("android-*"))
+            if not platforms:
+                sys.exit(f"error: no platforms under {sdk}")
+            android_jar = platforms[-1] / "android.jar"
+
+        run([str(aapt2), "link",
+             "-o", str(unsigned),
+             "-I", str(android_jar),
+             "--manifest", str(staging / "AndroidManifest.xml"),
+             "--min-sdk-version", "24",
+             "--target-sdk-version", "28"])
+
+        with zipfile.ZipFile(unsigned, "a") as archive:
+            info = zipfile.ZipInfo(library_rel, date_time=(1981, 1, 1, 1, 1, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o644 << 16
+            with (lib_dir / spec["library"]).open("rb") as handle:
+                archive.writestr(info, handle.read())
+            assets_info = zipfile.ZipInfo("assets/runtime.json", date_time=(1981, 1, 1, 1, 1, 0))
+            assets_info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(assets_info, (staging / "assets" / "runtime.json").read_bytes())
+
+    if final.exists():
+        final.unlink()
+    run([str(zipalign), "-f", "-p", "4", str(unsigned), str(aligned)])
+
+    sign_args = [str(apksigner), "sign",
+                 "--ks", str(DEBUG_KEYSTORE),
+                 "--ks-pass", "pass:android",
+                 "--key-pass", "pass:android",
+                 "--ks-key-alias", "androiddebugkey",
+                 "--v2-signing-enabled", "true",
+                 "--out", str(final), str(aligned)]
+    run(sign_args)
+
+    unsigned.unlink(missing_ok=True)
+    aligned.unlink(missing_ok=True)
+    return final
+
+
+def read_zip_entry(apk: Path, name: str) -> bytes:
+    with zipfile.ZipFile(apk) as archive:
+        return archive.read(name)
+
+
+def entry_is_stored(apk: Path, name: str) -> bool:
+    with zipfile.ZipFile(apk) as archive:
+        return archive.getinfo(name).compress_type == zipfile.ZIP_STORED
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a WebHTV runtime module APK")
+    parser.add_argument("--module", default="sherpa", choices=sorted(MODULES))
+    parser.add_argument("--abi", default="arm64-v8a")
+    parser.add_argument("--webhtv", type=Path, default=DEFAULT_WEBHTV)
+    parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
+    parser.add_argument("--native", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=REPO / "dist")
+    args = parser.parse_args()
+
+    if not args.webhtv.is_dir():
+        sys.exit(f"error: webhtv checkout not found: {args.webhtv}")
+
+    apk = build_module(args.module, args.abi, args.webhtv, args.sdk, args.out, args.native)
+
+    spec = MODULES[args.module]
+    library_rel = f"lib/{args.abi}/{spec['library']}"
+    if not entry_is_stored(apk, library_rel):
+        sys.exit(f"error: {library_rel} is compressed; nativeLibraryDir would not expose it")
+
+    manifest_bytes = read_zip_entry(apk, "assets/runtime.json")
+    payload = json.loads(manifest_bytes)
+
+    print(f"module      {payload['module']}")
+    print(f"package     {payload['packageName']}")
+    print(f"abi         {payload['abi']}")
+    print(f"apk         {apk}  ({apk.stat().st_size} bytes)")
+    print(f"library     {library_rel}  ({payload['files'][0]['size']} bytes, stored)")
+    print(f"sha256      {sha256_file(apk)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

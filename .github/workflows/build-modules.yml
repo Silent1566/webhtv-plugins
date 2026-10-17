@@ -1,0 +1,118 @@
+name: build-modules
+
+# Builds the module APKs and regenerates catalog.json.
+#
+# The workflow is intentionally split: building requires a WebHTV checkout for the native
+# libraries, while publishing only needs the artifacts. Anything that changes a digest must be
+# rebuilt here rather than hand-edited, because the host refuses a catalog whose digest does not
+# match the APK it downloads.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webhtv_ref:
+        description: WebHTV ref to take native libraries from
+        required: false
+        default: master
+  push:
+    tags:
+      - "modules-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Fetch WebHTV native libraries
+        run: |
+          git clone --depth 1 --branch "${{ inputs.webhtv_ref || 'master' }}" \
+            https://github.com/Silent1566/webhtv.git /tmp/webhtv
+
+      - name: Use the Android debug keystore
+        run: |
+          mkdir -p ~/.android
+          # A CI-only keystore. Module signing proves provenance to the platform installer; it is
+          # not the app signing key and is not shared with the host.
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build modules
+        env:
+          WEBHTV_DIR: /tmp/webhtv
+          ANDROID_SDK: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          python scripts/build_module.py --abi arm64-v8a
+          python scripts/build_module.py --abi armeabi-v7a
+
+      - name: Regenerate catalog
+        env:
+          ANDROID_SDK: ${{ env.ANDROID_SDK_ROOT }}
+        run: python scripts/gen_catalog.py --tag "${{ github.ref_name }}"
+
+      - name: Verify catalog matches the artifacts
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib, sys
+          catalog = json.loads(pathlib.Path("catalog.json").read_text(encoding="utf-8"))
+          if catalog.get("schema") != 1:
+              sys.exit(f"unexpected schema {catalog.get('schema')}")
+          for module in catalog["modules"]:
+              for artifact in module["artifacts"]:
+                  name = artifact["url"].rsplit("/", 1)[-1]
+                  path = pathlib.Path("dist") / name
+                  if not path.is_file():
+                      sys.exit(f"missing artifact {name}")
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  if digest != artifact["sha256"]:
+                      sys.exit(f"digest mismatch for {name}")
+                  if path.stat().st_size != artifact["size"]:
+                      sys.exit(f"size mismatch for {name}")
+                  print(f"ok {module['id']} {artifact['abi']} {artifact['sha256'][:16]}…")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-modules
+          path: |
+            dist/*.apk
+            catalog.json
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.apk
+            catalog.json
+
+      - name: Commit the refreshed catalog
+        if: github.ref_type == 'branch'
+        run: |
+          if git diff --quiet -- catalog.json; then
+            echo "catalog.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add catalog.json
+          git commit -m "chore(catalog): regenerate from built modules"
+          git push

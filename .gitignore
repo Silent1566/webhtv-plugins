@@ -1,0 +1,19 @@
+# Build output: module APKs are produced here and attached to a Release.
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local overrides
+local.properties
+.env
