@@ -84,6 +84,25 @@ MODULES = {
         },
         "source": "assets",
     },
+    "ijk": {
+        "module": "ijk",
+        "packageName": "com.silent.runtime.ijk",
+        "versionCode": 1,
+        "versionName": "1.0.0",
+        "compatibilityId": "ijk-jni-v1",
+        # IjkMediaPlayer asks for these by bare name ("ijkffmpeg") via System.loadLibrary, so the
+        # host installs a resolver mapping the bare name to the module's file. Order matters:
+        # libijksdl and libijkplayer both DT_NEEDED libijkffmpeg.
+        "libraries": [
+            "libijkffmpeg.so",
+            "libijksdl.so",
+            "libijkplayer.so",
+        ],
+        # Verified with readelf: the three libraries depend only on system libraries and each
+        # other, so no host-provided shared library is involved.
+        "hostLibraries": {},
+        "source": "jniLibs",
+    },
 }
 
 # Modules whose classes must already exist in the host APK; a module only ships .so files.

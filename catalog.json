@@ -2,6 +2,29 @@
   "schema": 1,
   "modules": [
     {
+      "id": "ijk",
+      "packageName": "com.silent.runtime.ijk",
+      "compatibilityId": "ijk-jni-v1",
+      "versionCode": 1,
+      "versionName": "1.0.0",
+      "artifacts": [
+        {
+          "abi": "arm64-v8a",
+          "minSdk": 24,
+          "size": 10355321,
+          "sha256": "431abf2a3b316743212eee7e12f116cac9c7b398c48b5ab1d45ebe89712c5963",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-ijk-1.0.0-arm64-v8a.apk"
+        },
+        {
+          "abi": "armeabi-v7a",
+          "minSdk": 24,
+          "size": 7623295,
+          "sha256": "a9a1bfa154846ecf1232cb5c6c82c1c156ebaaa38804a8bba907e83fd0201371",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-ijk-1.0.0-armeabi-v7a.apk"
+        }
+      ]
+    },
+    {
       "id": "mpv",
       "packageName": "com.silent.runtime.mpv",
       "compatibilityId": "mpv-jni-ffmpeg-shared-v1",
