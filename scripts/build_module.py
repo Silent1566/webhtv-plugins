@@ -38,7 +38,7 @@ DEFAULT_WEBHTV = Path(os.environ.get("WEBHTV_DIR", "F:/Workspace/webhtv"))
 DEFAULT_SDK = Path(os.environ.get("ANDROID_SDK", "C:/Users/Maple/AppData/Local/Android/Sdk"))
 DEBUG_KEYSTORE = Path.home() / ".android" / "debug.keystore"
 
-# Manifest of each module: what it is, what it needs, and where the library comes from.
+# Manifest of each module: what it is, what it needs, and where the libraries come from.
 MODULES = {
     "sherpa": {
         "module": "sherpa",
@@ -46,10 +46,43 @@ MODULES = {
         "versionCode": 1,
         "versionName": "1.0.0",
         "compatibilityId": "sherpa-onnx-jni-v1",
-        "library": "libsherpa-onnx-jni.so",
+        "libraries": ["libsherpa-onnx-jni.so"],
         # Verified with readelf: the library depends only on libandroid/liblog/libm/libdl/libc,
-        # so no host-provided shared library is involved. This is why sherpa is the pilot module.
+        # so no host-provided shared library is involved. This is why sherpa was the pilot module.
         "hostLibraries": {},
+        "source": "jniLibs",
+    },
+    "mpv": {
+        "module": "mpv",
+        "packageName": "com.silent.runtime.mpv",
+        "versionCode": 1,
+        "versionName": "1.0.0",
+        "compatibilityId": "mpv-jni-ffmpeg-shared-v1",
+        # The host's own LOAD_ORDER, minus c++_shared (which the host provides) and minus the
+        # .so the module does not ship. Order matters: the dynamic linker resolves each
+        # DT_NEEDED against what is already loaded.
+        "libraries": [
+            "libmvutil.so",
+            "libmwresample.so",
+            "libmwscale.so",
+            "libmvcodec.so",
+            "libmvformat.so",
+            "libmvfilter.so",
+            "libmvdevice.so",
+            "libmpv.so",
+            "libplayer.so",
+        ],
+        # libmvcodec/libmpv/libplayer all DT_NEEDED libc++_shared.so. The host already ships one
+        # copy (app/src/main/jniLibs) and the module must NOT bundle another: two copies collide
+        # on the same soname and the later one fails to dlopen with a missing-symbol error.
+        #
+        # The digest is per-ABI (the two host copies differ), so it is derived from the checkout
+        # at build time rather than hardcoded — a hardcoded value silently breaks the other ABI,
+        # and the host would reject the module at load time with a digest mismatch.
+        "hostLibraries": {
+            "libc++_shared.so": "@derive:app/src/main/jniLibs/{abi}/libc++_shared.so",
+        },
+        "source": "assets",
     },
 }
 
@@ -63,6 +96,29 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def find_native_libraries(module: str, abi: str, webhtv: Path, explicit: Path | None) -> dict[str, Path]:
+    """Locate every library the module ships."""
+    spec = MODULES[module]
+    found: dict[str, Path] = {}
+    for name in spec["libraries"]:
+        if explicit is not None and len(spec["libraries"]) == 1:
+            candidates = [explicit]
+        elif spec.get("source") == "assets":
+            candidates = [webhtv / "app" / "src" / f"{abi.replace('-', '_')}" / "assets" / "mpv-libs" / abi / name]
+        else:
+            candidates = [webhtv / "app" / "src" / "main" / "jniLibs" / abi / name]
+        for candidate in candidates:
+            if candidate.is_file():
+                found[name] = candidate
+                break
+        else:
+            sys.exit(
+                f"error: could not find {name} for {abi} ({module}).\nlooked in:\n"
+                + "\n".join(f"  {c}" for c in candidates)
+            )
+    return found
 
 
 def find_native_library(module: str, abi: str, webhtv: Path, explicit: Path | None) -> Path:
@@ -102,7 +158,29 @@ def run(command: list[str]) -> None:
         sys.exit(f"error: {' '.join(str(c) for c in command)}\n{result.stdout}\n{result.stderr}")
 
 
-def write_manifest(dest: Path, module: str, abi: str, library_rel: str, files: list[dict]) -> None:
+def resolve_host_libraries(spec: dict, abi: str, webhtv: Path) -> dict[str, str]:
+    """Resolve the module's hostLibraries digests for one ABI.
+
+    A value of ``@derive:<path>`` is replaced by the SHA-256 of that file inside the WebHTV
+    checkout, with ``{abi}`` substituted. Deriving beats hardcoding because the host ships a
+    different ``libc++_shared.so`` per ABI; a hardcoded digest would silently describe only one
+    of them and the host would reject the other at load time.
+    """
+    resolved: dict[str, str] = {}
+    for name, value in spec.get("hostLibraries", {}).items():
+        if value.startswith("@derive:"):
+            rel = value[len("@derive:"):].format(abi=abi)
+            path = webhtv / rel
+            if not path.is_file():
+                sys.exit(f"error: cannot derive host library digest, missing {path}")
+            resolved[name] = sha256_file(path)
+        else:
+            resolved[name] = value
+    return resolved
+
+
+def write_manifest(dest: Path, module: str, abi: str, entry_rel: str, load_order: list[str],
+                   host_libraries: dict[str, str], files: list[dict]) -> None:
     spec = MODULES[module]
     payload = {
         "module": spec["module"],
@@ -111,8 +189,9 @@ def write_manifest(dest: Path, module: str, abi: str, library_rel: str, files: l
         "versionName": spec["versionName"],
         "compatibilityId": spec["compatibilityId"],
         "abi": abi,
-        "library": library_rel,
-        "hostLibraries": spec["hostLibraries"],
+        "library": entry_rel,
+        "loadOrder": load_order,
+        "hostLibraries": host_libraries,
         "files": files,
     }
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -139,24 +218,32 @@ def write_android_manifest(dest: Path, module: str) -> None:
 
 def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, native: Path | None) -> Path:
     spec = MODULES[module]
-    source = find_native_library(module, abi, webhtv, native)
+    sources = find_native_libraries(module, abi, webhtv, native)
     out_dir.mkdir(parents=True, exist_ok=True)
     unsigned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-unsigned.apk"
     aligned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-aligned.apk"
     final = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}.apk"
 
-    library_rel = f"lib/{abi}/{spec['library']}"
-    native_size = source.stat().st_size
-    native_sha = sha256_file(source)
+    load_order = [f"lib/{abi}/{name}" for name in spec["libraries"]]
+    # The entry point is the last library: it depends on the rest, which are loaded first.
+    entry_rel = load_order[-1]
 
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp)
         lib_dir = staging / "lib" / abi
         lib_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, lib_dir / spec["library"])
 
-        files = [{"path": library_rel, "size": native_size, "sha256": native_sha}]
-        write_manifest(staging / "assets" / "runtime.json", module, abi, library_rel, files)
+        files = []
+        for name, source in sources.items():
+            shutil.copy2(source, lib_dir / name)
+            files.append({
+                "path": f"lib/{abi}/{name}",
+                "size": source.stat().st_size,
+                "sha256": sha256_file(source),
+            })
+
+        write_manifest(staging / "assets" / "runtime.json", module, abi, entry_rel, load_order,
+                       resolve_host_libraries(spec, abi, webhtv), files)
         write_android_manifest(staging / "AndroidManifest.xml", module)
 
         aapt2 = tool(sdk, "aapt2")
@@ -180,11 +267,13 @@ def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, 
              "--target-sdk-version", "28"])
 
         with zipfile.ZipFile(unsigned, "a") as archive:
-            info = zipfile.ZipInfo(library_rel, date_time=(1981, 1, 1, 1, 1, 0))
-            info.compress_type = zipfile.ZIP_STORED
-            info.external_attr = 0o644 << 16
-            with (lib_dir / spec["library"]).open("rb") as handle:
-                archive.writestr(info, handle.read())
+            for name in spec["libraries"]:
+                rel = f"lib/{abi}/{name}"
+                info = zipfile.ZipInfo(rel, date_time=(1981, 1, 1, 1, 1, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = 0o644 << 16
+                with (lib_dir / name).open("rb") as handle:
+                    archive.writestr(info, handle.read())
             assets_info = zipfile.ZipInfo("assets/runtime.json", date_time=(1981, 1, 1, 1, 1, 0))
             assets_info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(assets_info, (staging / "assets" / "runtime.json").read_bytes())
@@ -233,18 +322,26 @@ def main() -> int:
     apk = build_module(args.module, args.abi, args.webhtv, args.sdk, args.out, args.native)
 
     spec = MODULES[args.module]
-    library_rel = f"lib/{args.abi}/{spec['library']}"
-    if not entry_is_stored(apk, library_rel):
-        sys.exit(f"error: {library_rel} is compressed; nativeLibraryDir would not expose it")
+    # Every shipped library must be stored, not just the entry point: the platform only exposes
+    # nativeLibraryDir for entries it can map directly, and a deflated dependency would still be
+    # needed at load time.
+    for name in spec["libraries"]:
+        rel = f"lib/{args.abi}/{name}"
+        if not entry_is_stored(apk, rel):
+            sys.exit(f"error: {rel} is compressed; nativeLibraryDir would not expose it")
 
-    manifest_bytes = read_zip_entry(apk, "assets/runtime.json")
-    payload = json.loads(manifest_bytes)
+    payload = json.loads(read_zip_entry(apk, "assets/runtime.json"))
+    total = sum(entry["size"] for entry in payload["files"])
 
     print(f"module      {payload['module']}")
     print(f"package     {payload['packageName']}")
     print(f"abi         {payload['abi']}")
     print(f"apk         {apk}  ({apk.stat().st_size} bytes)")
-    print(f"library     {library_rel}  ({payload['files'][0]['size']} bytes, stored)")
+    print(f"libraries   {len(payload['files'])} stored ({total} bytes)")
+    print(f"entry       {payload['library']}")
+    if payload.get("hostLibraries"):
+        for host, digest in payload["hostLibraries"].items():
+            print(f"host lib    {host}  {digest[:16]}…")
     print(f"sha256      {sha256_file(apk)}")
     return 0
 

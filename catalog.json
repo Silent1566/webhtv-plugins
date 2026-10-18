@@ -2,6 +2,29 @@
   "schema": 1,
   "modules": [
     {
+      "id": "mpv",
+      "packageName": "com.silent.runtime.mpv",
+      "compatibilityId": "mpv-jni-ffmpeg-shared-v1",
+      "versionCode": 1,
+      "versionName": "1.0.0",
+      "artifacts": [
+        {
+          "abi": "arm64-v8a",
+          "minSdk": 24,
+          "size": 45376556,
+          "sha256": "67b7c8434756e82fb3ae542f188268e66c14a6fc08c220e5e7998aa2485729e8",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-mpv-1.0.0-arm64-v8a.apk"
+        },
+        {
+          "abi": "armeabi-v7a",
+          "minSdk": 24,
+          "size": 39539774,
+          "sha256": "c266b955d8bef032f1ad1ba71d0c89e6333494da8ab90a4bd18e3b9d188f34ac",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-mpv-1.0.0-armeabi-v7a.apk"
+        }
+      ]
+    },
+    {
       "id": "sherpa",
       "packageName": "com.silent.runtime.sherpa",
       "compatibilityId": "sherpa-onnx-jni-v1",

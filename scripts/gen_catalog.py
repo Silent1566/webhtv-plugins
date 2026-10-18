@@ -27,6 +27,7 @@ CATALOG = REPO / "catalog.json"
 # Module id -> (package name, compatibility contract). Kept in sync with scripts/build_module.py.
 PACKAGES = {
     "sherpa": ("com.silent.runtime.sherpa", "sherpa-onnx-jni-v1"),
+    "mpv": ("com.silent.runtime.mpv", "mpv-jni-ffmpeg-shared-v1"),
 }
 
 ARTIFACT_NAME = re.compile(r"^runtime-(?P<module>[a-z0-9]+)-(?P<version>\d+\.\d+\.\d+)-(?P<abi>[a-z0-9_-]+)\.apk$")
