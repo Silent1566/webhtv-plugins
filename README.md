@@ -60,10 +60,19 @@ python scripts/gen_catalog.py
 | `jniLibs` | 取 WebHTV 的 `app/src/main/jniLibs/<abi>/` | sherpa、ijk |
 | `assets` | 取 WebHTV 的 `app/src/<abi_flavor>/assets/mpv-libs/<abi>/` | mpv |
 | `cmake` | **用 WebHTV 自己的 CMake 目标现场构建** | dv5 |
+| `chaquopy` | 取 WebHTV 的 `chaquo/build/intermediates/`（Chaquopy 插件产出） | python |
 
 `cmake` 这一种是必要的：`libexo_dovi_renderer.so` 是编译产物，WebHTV 仓库里只有
 `app/src/main/cpp/exo_dovi_renderer.cpp` 与 `third_party/exo-dv5-native/prebuilt/*.a`，
 没有已构建的 `.so` 可复制。现场构建也保证模块与宿主同源，不会因签入的二进制漂移。
+
+`chaquopy` 同理，而且更重：Python 的 8 个库与 `assets/chaquopy/**` 全部是构建产物
+（`git ls-files` 确认未跟踪），由 Chaquopy Gradle 插件产出，需要构建机上有
+Python 3.10 与 pip 网络访问（`requirements.txt` 的 8 个依赖）。
+因此 CI 在调用本脚本前必须先构建 WebHTV 检出。
+
+模块可用 `payload` 字段声明「除原生库外还要带的目录树」，目前只有 `python` 用：
+`assets/chaquopy/**` 是解释器启动所必需的，会在清单里逐个登记摘要。
 
 构建时链接参数带 `-Wl,--build-id=none`。这不是随手加的：`catalog.json` 为每个产物固定
 一个 SHA-256，宿主拒绝摘要不符的下载，而 build-id 由链接输出（含构建目录路径）导出，
@@ -172,9 +181,14 @@ python scripts/gen_catalog.py --tag modules
 | `mpv` | `com.silent.runtime.mpv` | `mpv-jni-ffmpeg-shared-v1` | 43.3 MB | MPV 播放核心（9 库） |
 | `ijk` | `com.silent.runtime.ijk` | `ijk-jni-v1` | 9.9 MB | IJK 播放内核（3 库） |
 | `dv5` | `com.silent.runtime.dv5` | `exo-dv5-renderer-v1` | 9.2 MB | 杜比视界 Profile 5 的 GPU 映射渲染器 |
+| `python` | `com.silent.runtime.python` | `chaquopy-python310-v1` | 19.0 MB | Python 爬虫运行时（Chaquopy，8 库 + 载荷树） |
 
-`sherpa`/`mpv`/`ijk` 的库取自 WebHTV 的签入路径，`dv5` 的库由 CMake 现场构建
-（见「库的来源」）。
+`sherpa`/`mpv`/`ijk` 的库取自 WebHTV 的签入路径，`dv5` 的库由 CMake 现场构建，
+`python` 的库与载荷由 Chaquopy 插件产出（均见「库的来源」）。
+
+`python` 是唯一不只带原生库的模块：Chaquopy 的解释器要从 `assets/chaquopy/**` 树
+读 stdlib、requirements 与 bootstrap，所以那 20 个文件也随模块分发，
+并在清单里逐个登记摘要（宿主在运行时读取前会全树校验）。
 
 ## 兼容性约束
 

@@ -30,6 +30,7 @@ PACKAGES = {
     "mpv": ("com.silent.runtime.mpv", "mpv-jni-ffmpeg-shared-v1"),
     "ijk": ("com.silent.runtime.ijk", "ijk-jni-v1"),
     "dv5": ("com.silent.runtime.dv5", "exo-dv5-renderer-v1"),
+    "python": ("com.silent.runtime.python", "chaquopy-python310-v1"),
 }
 
 ARTIFACT_NAME = re.compile(r"^runtime-(?P<module>[a-z0-9]+)-(?P<version>\d+\.\d+\.\d+)-(?P<abi>[a-z0-9_-]+)\.apk$")

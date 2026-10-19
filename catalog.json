@@ -69,6 +69,27 @@
       ]
     },
     {
+      "id": "python",
+      "packageName": "com.silent.runtime.python",
+      "compatibilityId": "chaquopy-python310-v1",
+      "artifacts": [
+        {
+          "abi": "arm64-v8a",
+          "minSdk": 24,
+          "size": 19938211,
+          "sha256": "1c8e71a60f7b6a72b7096b3c2a224f4cbf44e585c0010e93b85c41d14def6a13",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-python-1.0.0-arm64-v8a.apk"
+        },
+        {
+          "abi": "armeabi-v7a",
+          "minSdk": 24,
+          "size": 16239567,
+          "sha256": "13d7a2324edca5bd33af4ac4733a1e309aee2bdff255406e692e715ff8ee422e",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-python-1.0.0-armeabi-v7a.apk"
+        }
+      ]
+    },
+    {
       "id": "sherpa",
       "packageName": "com.silent.runtime.sherpa",
       "compatibilityId": "sherpa-onnx-jni-v1",

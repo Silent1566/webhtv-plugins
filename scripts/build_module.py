@@ -126,6 +126,43 @@ MODULES = {
             "platform": "android-26",
         },
     },
+    "python": {
+        "module": "python",
+        "packageName": "com.silent.runtime.python",
+        "versionCode": 1,
+        "versionName": "1.0.0",
+        "compatibilityId": "chaquopy-python310-v1",
+        # Topological order, measured in S12, not Chaquopy's own bare-name sequence.
+        #
+        # Platform.loadNativeLibs() loads crypto_chaquopy, ssl_chaquopy, sqlite3_chaquopy,
+        # python3.10, chaquopy_java - but readelf shows libcrypto_chaquopy depends on
+        # libcrypto_python, libssl_chaquopy on libssl_python, libsqlite3_chaquopy on
+        # libsqlite3_python, and libssl_python on libcrypto_python. Bare names survive that
+        # because the linker falls back to searching the namespace's library paths; a module's
+        # directory is not on that path, so each dependency must already be mapped.
+        "libraries": [
+            "libcrypto_python.so",
+            "libpython3.10.so",
+            "libsqlite3_python.so",
+            "libssl_python.so",
+            "libcrypto_chaquopy.so",
+            "libssl_chaquopy.so",
+            "libsqlite3_chaquopy.so",
+            "libchaquopy_java.so",
+        ],
+        # Verified with readelf: the eight libraries depend only on system libraries and each
+        # other, so no host-provided shared library is involved. libpython3.10.so carries no
+        # soname, which S10 measured is still satisfiable by preloading it by absolute path.
+        "hostLibraries": {},
+        # Chaquopy's payload is not only native libraries: the interpreter's stdlib, requirements
+        # and bootstrap live in a tree of assets the runtime reads through an AssetManager. Both
+        # halves are build products of the WebHTV checkout, produced by the Chaquopy Gradle plugin.
+        "source": "chaquopy",
+        "payload": {
+            "from": "chaquo/build/intermediates/assets/{flavor}Debug/merge{flavor}DebugAssets/chaquopy",
+            "to": "assets/chaquopy",
+        },
+    },
 }
 
 # Modules whose classes must already exist in the host APK; a module only ships .so files.
@@ -234,6 +271,14 @@ def find_native_libraries(module: str, abi: str, webhtv: Path, sdk: Path,
         elif spec.get("source") == "cmake":
             found[name] = build_with_cmake(module, abi, webhtv, sdk, name)
             continue
+        elif spec.get("source") == "chaquopy":
+            # Chaquopy's own Gradle plugin produces these, so they live in the chaquo module's build
+            # output rather than in a checked-in directory. The host checkout must have been built
+            # for this ABI first, which is what the CI step does before calling this script.
+            flavor = abi.replace("-", "_")
+            candidates = [webhtv / "chaquo" / "build" / "intermediates" / "library_jni"
+                          / f"{flavor}Debug" / f"copy{flavor}DebugJniLibsProjectOnly"
+                          / "jni" / abi / name]
         elif spec.get("source") == "assets":
             candidates = [webhtv / "app" / "src" / f"{abi.replace('-', '_')}" / "assets" / "mpv-libs" / abi / name]
         else:
@@ -248,6 +293,27 @@ def find_native_libraries(module: str, abi: str, webhtv: Path, sdk: Path,
                 + "\n".join(f"  {c}" for c in candidates)
             )
     return found
+
+
+def find_payload(module: str, abi: str, webhtv: Path) -> Path | None:
+    """Locate an extra payload tree the module ships besides its native libraries.
+
+    Returns the source directory, or None when the module declares no payload. The Python module
+    needs this: Chaquopy's interpreter reads its stdlib, requirements and bootstrap from a tree of
+    assets inside the APK, so those files have to travel in the module for the runtime to start.
+    """
+    spec = MODULES[module]
+    payload = spec.get("payload")
+    if not payload:
+        return None
+    flavor = abi.replace("-", "_")
+    source = webhtv / payload["from"].format(flavor=flavor)
+    if not source.is_dir():
+        sys.exit(
+            f"error: payload directory not found for {module} ({abi}): {source}\n"
+            "build the WebHTV checkout for this ABI first"
+        )
+    return source
 
 
 def find_native_library(module: str, abi: str, webhtv: Path, explicit: Path | None) -> Path:
@@ -371,6 +437,24 @@ def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, 
                 "sha256": sha256_file(source),
             })
 
+        # An extra payload tree, when the module declares one. Every file is listed in the manifest
+        # with its digest, so the host verifies the whole tree before the runtime reads it.
+        payload_source = find_payload(module, abi, webhtv)
+        payload_entries: list[tuple[str, Path]] = []
+        if payload_source is not None:
+            payload_rel = spec["payload"]["to"]
+            for path in sorted(payload_source.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(payload_source).as_posix()
+                declared = f"{payload_rel}/{rel}"
+                payload_entries.append((declared, path))
+                files.append({
+                    "path": declared,
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                })
+
         write_manifest(staging / "assets" / "runtime.json", module, abi, entry_rel, load_order,
                        resolve_host_libraries(spec, abi, webhtv), files)
         write_android_manifest(staging / "AndroidManifest.xml", module)
@@ -406,6 +490,13 @@ def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, 
             assets_info = zipfile.ZipInfo("assets/runtime.json", date_time=(1981, 1, 1, 1, 1, 0))
             assets_info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(assets_info, (staging / "assets" / "runtime.json").read_bytes())
+            # Payload files are deflated: unlike the .so entries they are not mapped, and the
+            # interpreter reads them through an AssetManager, which decompresses transparently.
+            for declared, path in payload_entries:
+                info = zipfile.ZipInfo(declared, date_time=(1981, 1, 1, 1, 1, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o644 << 16
+                archive.writestr(info, path.read_bytes())
 
     if final.exists():
         final.unlink()
