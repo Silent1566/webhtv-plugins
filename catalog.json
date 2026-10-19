@@ -2,6 +2,27 @@
   "schema": 1,
   "modules": [
     {
+      "id": "dv5",
+      "packageName": "com.silent.runtime.dv5",
+      "compatibilityId": "exo-dv5-renderer-v1",
+      "artifacts": [
+        {
+          "abi": "arm64-v8a",
+          "minSdk": 24,
+          "size": 9609710,
+          "sha256": "a59db63b63f574c288998bb20472c741ab06f23407e3d2ae5c54c85d2afff97d",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-dv5-1.0.0-arm64-v8a.apk"
+        },
+        {
+          "abi": "armeabi-v7a",
+          "minSdk": 24,
+          "size": 6771184,
+          "sha256": "1310aebb9dc125d9c85f6767eb218f4632ea13500ab0b7c2156cf02ba7262aa2",
+          "url": "https://github.com/Silent1566/webhtv-plugins/releases/download/modules/runtime-dv5-1.0.0-armeabi-v7a.apk"
+        }
+      ]
+    },
+    {
       "id": "ijk",
       "packageName": "com.silent.runtime.ijk",
       "compatibilityId": "ijk-jni-v1",

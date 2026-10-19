@@ -103,6 +103,29 @@ MODULES = {
         "hostLibraries": {},
         "source": "jniLibs",
     },
+    "dv5": {
+        "module": "dv5",
+        "packageName": "com.silent.runtime.dv5",
+        "versionCode": 1,
+        "versionName": "1.0.0",
+        "compatibilityId": "exo-dv5-renderer-v1",
+        # ExoDv5Native asks for this by bare name via System.loadLibrary, so the host installs a
+        # resolver mapping the bare name to the module's file.
+        "libraries": ["libexo_dovi_renderer.so"],
+        # Verified with readelf: the library depends only on system libraries
+        # (libandroid/liblog/libmediandk/libvulkan/libdl/libm/libc) and carries a soname, so no
+        # host-provided shared library is involved.
+        "hostLibraries": {},
+        # Unlike the other modules this library is not checked into the WebHTV tree: it is built by
+        # CMake from app/src/main/cpp/exo_dovi_renderer.cpp against the static libraries under
+        # third_party/exo-dv5-native/prebuilt. "cmake" tells find_native_libraries to build it.
+        "source": "cmake",
+        "cmake": {
+            "sourceDir": "app/src/main/cpp",
+            "target": "exo_dovi_renderer",
+            "platform": "android-26",
+        },
+    },
 }
 
 # Modules whose classes must already exist in the host APK; a module only ships .so files.
@@ -117,13 +140,100 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def find_native_libraries(module: str, abi: str, webhtv: Path, explicit: Path | None) -> dict[str, Path]:
+def sdk_tool(sdk: Path, *parts: str) -> str:
+    """Locate an executable under the SDK root, preferring the newest version directory."""
+    exe = parts[-1] + (".exe" if os.name == "nt" else "")
+    roots = sorted((sdk / parts[0]).iterdir(), reverse=True) if (sdk / parts[0]).is_dir() else []
+    for root in roots:
+        candidate = root.joinpath(*parts[1:-1], exe)
+        if candidate.is_file():
+            return str(candidate)
+    sys.exit(f"error: {'/'.join(parts)} not found under {sdk}")
+
+
+def build_with_cmake(module: str, abi: str, webhtv: Path, sdk: Path, name: str) -> Path:
+    """Builds a library that is not checked in, using the project's own CMake target.
+
+    Most modules ship libraries that live in the WebHTV tree, so a checkout is enough to package
+    them. The DV5 renderer is different: it is compiled from app/src/main/cpp against the static
+    libraries under third_party/exo-dv5-native/prebuilt, and no built .so is tracked. Building it
+    here keeps the module derived from the same source as the host rather than from a checked-in
+    binary that could drift.
+
+    The result is stripped, because CMake's default output carries debug info and is more than
+    twice the size (21.3 MiB vs 9.1 MiB for arm64).
+    """
+    spec = MODULES[module]["cmake"]
+    source_dir = webhtv / spec["sourceDir"]
+    if not source_dir.is_dir():
+        sys.exit(f"error: cmake source dir not found: {source_dir}")
+
+    ndk_root = sdk / "ndk"
+    if not ndk_root.is_dir():
+        sys.exit(f"error: no NDK under {sdk}")
+    toolchain = None
+    ndk_version = None
+    for version in sorted(ndk_root.iterdir(), reverse=True):
+        candidate = version / "build" / "cmake" / "android.toolchain.cmake"
+        if candidate.is_file():
+            toolchain = candidate
+            ndk_version = version
+            break
+    if toolchain is None:
+        sys.exit(f"error: no android.toolchain.cmake under {ndk_root}")
+
+    cmake = sdk_tool(sdk, "cmake", "bin", "cmake")
+    ninja = sdk_tool(sdk, "cmake", "bin", "ninja")
+    host_tag = "windows-x86_64" if os.name == "nt" else "linux-x86_64"
+    strip = ndk_version / "toolchains" / "llvm" / "prebuilt" / host_tag / "bin" / \
+        ("llvm-strip.exe" if os.name == "nt" else "llvm-strip")
+    if not strip.is_file():
+        sys.exit(f"error: llvm-strip not found: {strip}")
+
+    build_dir = Path(tempfile.mkdtemp(prefix=f"cmake-{module}-{abi}-"))
+    run([cmake, "-S", str(source_dir), "-B", str(build_dir), "-G", "Ninja",
+         f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+         f"-DANDROID_ABI={abi}",
+         f"-DANDROID_PLATFORM={spec['platform']}",
+         f"-DCMAKE_MAKE_PROGRAM={ninja}",
+         "-DCMAKE_BUILD_TYPE=Release",
+         # Build-id off, so the artifact is reproducible.
+         #
+         # The catalog pins a SHA-256 per artifact, and the host refuses a download whose digest
+         # does not match. A build-id is derived from the linked output, which records the build
+         # directory, so with it enabled two builds of the same source in different directories
+         # produce different digests - measured: 9,584,504 bytes either way, but only
+         # .note.gnu.build-id differed (20 of its 36 bytes). With the flag the same two builds are
+         # byte-identical. Nothing here needs a build-id: Android loads the library by name, and
+         # these artifacts are stripped release payloads with no separate debug symbols to match.
+         "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--build-id=none"])
+    run([cmake, "--build", str(build_dir), "--target", spec["target"]])
+
+    built = build_dir / name
+    if not built.is_file():
+        # CMake may place the output in a subdirectory depending on the generator.
+        matches = list(build_dir.rglob(name))
+        if not matches:
+            sys.exit(f"error: cmake did not produce {name} under {build_dir}")
+        built = matches[0]
+
+    stripped = build_dir / f"stripped-{name}"
+    shutil.copy2(built, stripped)
+    run([str(strip), "--strip-unneeded", str(stripped)])
+    return stripped
+
+
+def find_native_libraries(module: str, abi: str, webhtv: Path, sdk: Path,
+                          explicit: Path | None) -> dict[str, Path]:
     """Locate every library the module ships."""
     spec = MODULES[module]
     found: dict[str, Path] = {}
     for name in spec["libraries"]:
         if explicit is not None and len(spec["libraries"]) == 1:
             candidates = [explicit]
+        elif spec.get("source") == "cmake":
+            found[name] = build_with_cmake(module, abi, webhtv, sdk, name)
+            continue
         elif spec.get("source") == "assets":
             candidates = [webhtv / "app" / "src" / f"{abi.replace('-', '_')}" / "assets" / "mpv-libs" / abi / name]
         else:
@@ -237,7 +347,7 @@ def write_android_manifest(dest: Path, module: str) -> None:
 
 def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, native: Path | None) -> Path:
     spec = MODULES[module]
-    sources = find_native_libraries(module, abi, webhtv, native)
+    sources = find_native_libraries(module, abi, webhtv, sdk, native)
     out_dir.mkdir(parents=True, exist_ok=True)
     unsigned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-unsigned.apk"
     aligned = out_dir / f"runtime-{module}-{spec['versionName']}-{abi}-aligned.apk"
@@ -329,6 +439,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a WebHTV runtime module APK")
     parser.add_argument("--module", default="sherpa", choices=sorted(MODULES))
     parser.add_argument("--abi", default="arm64-v8a")
+    parser.add_argument("--all", action="store_true",
+                        help="build every module for every ABI (used by CI)")
     parser.add_argument("--webhtv", type=Path, default=DEFAULT_WEBHTV)
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--native", type=Path, default=None)
@@ -337,6 +449,15 @@ def main() -> int:
 
     if not args.webhtv.is_dir():
         sys.exit(f"error: webhtv checkout not found: {args.webhtv}")
+
+    if args.all:
+        # CI builds everything it ships, so a module cannot be added to the catalog without a
+        # reproducible way to rebuild it. Building only the default module previously left mpv and
+        # ijk artifacts in the catalog that CI could not reproduce.
+        for module in sorted(MODULES):
+            for abi in ("arm64-v8a", "armeabi-v7a"):
+                build_module(module, abi, args.webhtv, args.sdk, args.out, None)
+        return 0
 
     apk = build_module(args.module, args.abi, args.webhtv, args.sdk, args.out, args.native)
 

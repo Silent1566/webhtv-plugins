@@ -32,21 +32,43 @@ scripts/gen_catalog.py       由 dist/ 重新生成 catalog.json
 dist/                        构建产物（不入库）
 ```
 
-## 构建一个模块
+## 构建模块
 
-需要 Python 3.10+、Android SDK build-tools（`aapt2`/`zipalign`/`apksigner`），以及一份 WebHTV 源码
-用于取原生库。
+需要 Python 3.10+、Android SDK（build-tools 的 `aapt2`/`zipalign`/`apksigner`，
+以及 NDK 与 CMake —— 见下方「库的来源」），以及一份 WebHTV 源码用于取原生库。
 
 ```bash
-# 从 WebHTV 源码取库并打包
-python scripts/build_module.py --abi arm64-v8a
+# 构建全部模块的全部 ABI（CI 用的就是这一条）
+python scripts/build_module.py --all
+
+# 只构建一个模块
+python scripts/build_module.py --module sherpa --abi arm64-v8a
 
 # 指定现成的库文件
-python scripts/build_module.py --abi arm64-v8a --native /path/to/libsherpa-onnx-jni.so
+python scripts/build_module.py --module sherpa --abi arm64-v8a --native /path/to/libsherpa-onnx-jni.so
 
 # 生成 catalog.json
 python scripts/gen_catalog.py
 ```
+
+### 库的来源
+
+模块的库有两种来源，由 `MODULES` 里的 `source` 字段决定：
+
+| `source` | 含义 | 例子 |
+| --- | --- | --- |
+| `jniLibs` | 取 WebHTV 的 `app/src/main/jniLibs/<abi>/` | sherpa、ijk |
+| `assets` | 取 WebHTV 的 `app/src/<abi_flavor>/assets/mpv-libs/<abi>/` | mpv |
+| `cmake` | **用 WebHTV 自己的 CMake 目标现场构建** | dv5 |
+
+`cmake` 这一种是必要的：`libexo_dovi_renderer.so` 是编译产物，WebHTV 仓库里只有
+`app/src/main/cpp/exo_dovi_renderer.cpp` 与 `third_party/exo-dv5-native/prebuilt/*.a`，
+没有已构建的 `.so` 可复制。现场构建也保证模块与宿主同源，不会因签入的二进制漂移。
+
+构建时链接参数带 `-Wl,--build-id=none`。这不是随手加的：`catalog.json` 为每个产物固定
+一个 SHA-256，宿主拒绝摘要不符的下载，而 build-id 由链接输出（含构建目录路径）导出，
+开启时同一源码在不同目录构建会得到不同摘要（实测：两者均为 9,584,504 字节，
+仅 `.note.gnu.build-id` 的 36 字节中有 20 字节不同）。关掉后同样两次构建逐字节一致。
 
 `build_module.py` 会校验两件容易出错的事：
 
@@ -147,6 +169,12 @@ python scripts/gen_catalog.py --tag modules
 | id | 包名 | 契约 | arm64-v8a | 说明 |
 | --- | --- | --- | --- | --- |
 | `sherpa` | `com.silent.runtime.sherpa` | `sherpa-onnx-jni-v1` | 22.5 MB | 实时字幕语音识别（sherpa-onnx） |
+| `mpv` | `com.silent.runtime.mpv` | `mpv-jni-ffmpeg-shared-v1` | 43.3 MB | MPV 播放核心（9 库） |
+| `ijk` | `com.silent.runtime.ijk` | `ijk-jni-v1` | 9.9 MB | IJK 播放内核（3 库） |
+| `dv5` | `com.silent.runtime.dv5` | `exo-dv5-renderer-v1` | 9.2 MB | 杜比视界 Profile 5 的 GPU 映射渲染器 |
+
+`sherpa`/`mpv`/`ijk` 的库取自 WebHTV 的签入路径，`dv5` 的库由 CMake 现场构建
+（见「库的来源」）。
 
 ## 兼容性约束
 
