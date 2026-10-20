@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -159,7 +160,7 @@ MODULES = {
         # halves are build products of the WebHTV checkout, produced by the Chaquopy Gradle plugin.
         "source": "chaquopy",
         "payload": {
-            "from": "chaquo/build/intermediates/assets/{flavor}Debug/merge{flavor}DebugAssets/chaquopy",
+            "from": "chaquo/build/intermediates/assets/{abi_flavor}Debug/merge{abi_variant}DebugAssets/chaquopy",
             "to": "assets/chaquopy",
         },
     },
@@ -175,6 +176,100 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def normalize_imy_bytes(data: bytes) -> bytes:
+    """Returns a byte-for-byte reproducible form of a Chaquopy ``.imy`` archive.
+
+    A ``.imy`` is a zip of ``.pyc`` files, and two things in it depend on *when* the build ran
+    rather than on the sources:
+
+    * Chaquopy compiles with ``python -m compileall`` and never passes ``--invalidation-mode``, so
+      the bytecode uses the default timestamp mode and each ``.pyc`` header embeds the source
+      file's mtime. A ``git clone`` sets mtime to the clone time, so every CI build differs.
+    * The zip entries carry the build's own timestamps.
+
+    Both are normalized here. Measured before this: a clean checkout and a local build produced
+    identical package versions yet different module digests, with all 349 ``.pyc`` headers
+    differing.
+
+    Normalizing the header is safe because the payload ships ``.pyc`` files with no ``.py``
+    alongside them, and Chaquopy loads them through ``SourcelessAssetLoader`` (verified in
+    ``importer.py``), which never consults the header: it was exercised with the mtime and size
+    fields overwritten and the code still loaded.
+
+    One thing this cannot do is reorder the frozenset constants CPython's peephole optimizer folds
+    out of ``x in {...}``: their order follows the hash seed. That is why the build also pins
+    ``PYTHONHASHSEED``; with it set, two clean builds were byte-identical.
+
+    Entries are re-emitted in sorted order with a fixed timestamp and no compression, so the
+    result depends only on the file contents.
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        entries = sorted(source.infolist(), key=lambda i: i.filename)
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as target:
+            for entry in entries:
+                content = bytearray(source.read(entry.filename))
+                if entry.filename.endswith(".pyc") and len(content) >= 16:
+                    flags = struct.unpack_from("<I", content, 4)[0]
+                    if flags == 0:
+                        # Timestamp mode: zero the source mtime and size so the header stops
+                        # recording when the checkout happened.
+                        struct.pack_into("<I", content, 8, 0)
+                        struct.pack_into("<I", content, 12, 0)
+                info = zipfile.ZipInfo(entry.filename, date_time=(1981, 1, 1, 1, 1, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = entry.external_attr
+                target.writestr(info, bytes(content))
+    return out.getvalue()
+
+
+def collect_payload(source: Path, dest_prefix: str) -> list[tuple[str, bytes]]:
+    """Returns the whole payload tree as packaged bytes, normalized where needed.
+
+    This runs in two passes because one file depends on the others. ``build.json`` records a
+    digest for every asset, and the ``.imy`` digests change when their bytecode headers are
+    normalized — so the digests have to be recomputed first and written back, otherwise
+    ``build.json`` would still describe the un-normalized archives and the module digest would keep
+    drifting even though every archive was stable.
+
+    ``build.json`` itself is only used by Chaquopy to decide whether an already-extracted asset is
+    current (``extractAsset`` compares the recorded digest with what it stored in preferences), so
+    rewriting it with the normalized digests keeps it self-consistent.
+    """
+    contents: dict[str, bytes] = {}
+    for path in sorted(source.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(source).as_posix()
+        contents[rel] = path.read_bytes()
+
+    # Pass one: normalize the archives and remember their new digests.
+    digests: dict[str, str] = {}
+    for rel, data in list(contents.items()):
+        if rel.endswith(".imy"):
+            normalized = normalize_imy_bytes(data)
+            contents[rel] = normalized
+            digests[rel] = hashlib.sha256(normalized).hexdigest()
+
+    # Pass two: point build.json at the normalized digests.
+    if "build.json" in contents and digests:
+        manifest = json.loads(contents["build.json"])
+        assets = manifest.get("assets")
+        if isinstance(assets, dict):
+            updated = 0
+            for rel, digest in digests.items():
+                if rel in assets:
+                    assets[rel] = digest
+                    updated += 1
+            if updated != len(digests):
+                missing = sorted(set(digests) - set(assets))
+                sys.exit(f"error: build.json does not describe every archive: {missing}")
+            contents["build.json"] = json.dumps(
+                manifest, indent=4, ensure_ascii=False).encode("utf-8")
+
+    return [(f"{dest_prefix}/{rel}", contents[rel]) for rel in sorted(contents)]
 
 
 def sdk_tool(sdk: Path, *parts: str) -> str:
@@ -260,6 +355,19 @@ def build_with_cmake(module: str, abi: str, webhtv: Path, sdk: Path, name: str) 
     return stripped
 
 
+def gradle_variant(abi: str) -> tuple[str, str]:
+    """Returns the two spellings Gradle uses for an ABI, as ``(ablavor, Variant)``.
+
+    The build directory is ``<abi_flavor>Debug`` (``arm64_v8aDebug``) but the task output
+    directories capitalize the first letter (``copyArm64_v8aDebugJniLibsProjectOnly``,
+    ``mergeArm64_v8aDebugAssets``). Getting this wrong works on Windows, where paths are
+    case-insensitive, and fails on the Linux CI runner - so both spellings are derived in one
+    place rather than repeated at each call site.
+    """
+    flavor = abi.replace("-", "_")
+    return flavor, flavor[:1].upper() + flavor[1:]
+
+
 def find_native_libraries(module: str, abi: str, webhtv: Path, sdk: Path,
                           explicit: Path | None) -> dict[str, Path]:
     """Locate every library the module ships."""
@@ -275,9 +383,9 @@ def find_native_libraries(module: str, abi: str, webhtv: Path, sdk: Path,
             # Chaquopy's own Gradle plugin produces these, so they live in the chaquo module's build
             # output rather than in a checked-in directory. The host checkout must have been built
             # for this ABI first, which is what the CI step does before calling this script.
-            flavor = abi.replace("-", "_")
+            flavor, variant = gradle_variant(abi)
             candidates = [webhtv / "chaquo" / "build" / "intermediates" / "library_jni"
-                          / f"{flavor}Debug" / f"copy{flavor}DebugJniLibsProjectOnly"
+                          / f"{flavor}Debug" / f"copy{variant}DebugJniLibsProjectOnly"
                           / "jni" / abi / name]
         elif spec.get("source") == "assets":
             candidates = [webhtv / "app" / "src" / f"{abi.replace('-', '_')}" / "assets" / "mpv-libs" / abi / name]
@@ -306,8 +414,8 @@ def find_payload(module: str, abi: str, webhtv: Path) -> Path | None:
     payload = spec.get("payload")
     if not payload:
         return None
-    flavor = abi.replace("-", "_")
-    source = webhtv / payload["from"].format(flavor=flavor)
+    flavor, variant = gradle_variant(abi)
+    source = webhtv / payload["from"].format(abi_flavor=flavor, abi_variant=variant)
     if not source.is_dir():
         sys.exit(
             f"error: payload directory not found for {module} ({abi}): {source}\n"
@@ -439,20 +547,20 @@ def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, 
 
         # An extra payload tree, when the module declares one. Every file is listed in the manifest
         # with its digest, so the host verifies the whole tree before the runtime reads it.
+        #
+        # The digests are taken over the bytes that will actually be packaged (see collect_payload),
+        # not over the files on disk: the archives are normalized to remove build timestamps and
+        # build.json is rewritten to match, so hashing the raw files would record digests the host
+        # could never match.
         payload_source = find_payload(module, abi, webhtv)
-        payload_entries: list[tuple[str, Path]] = []
+        payload_entries: list[tuple[str, bytes]] = []
         if payload_source is not None:
-            payload_rel = spec["payload"]["to"]
-            for path in sorted(payload_source.rglob("*")):
-                if not path.is_file():
-                    continue
-                rel = path.relative_to(payload_source).as_posix()
-                declared = f"{payload_rel}/{rel}"
-                payload_entries.append((declared, path))
+            payload_entries = collect_payload(payload_source, spec["payload"]["to"])
+            for declared, data in payload_entries:
                 files.append({
                     "path": declared,
-                    "size": path.stat().st_size,
-                    "sha256": sha256_file(path),
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
                 })
 
         write_manifest(staging / "assets" / "runtime.json", module, abi, entry_rel, load_order,
@@ -492,11 +600,11 @@ def build_module(module: str, abi: str, webhtv: Path, sdk: Path, out_dir: Path, 
             archive.writestr(assets_info, (staging / "assets" / "runtime.json").read_bytes())
             # Payload files are deflated: unlike the .so entries they are not mapped, and the
             # interpreter reads them through an AssetManager, which decompresses transparently.
-            for declared, path in payload_entries:
+            for declared, data in payload_entries:
                 info = zipfile.ZipInfo(declared, date_time=(1981, 1, 1, 1, 1, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o644 << 16
-                archive.writestr(info, path.read_bytes())
+                archive.writestr(info, data)
 
     if final.exists():
         final.unlink()

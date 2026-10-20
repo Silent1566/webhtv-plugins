@@ -29,7 +29,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Chaquopy embeds CPython 3.10 into the python module, and its Gradle plugin refuses to
+          # build with a different interpreter. The packaging scripts run fine on 3.10 as well, so
+          # one version serves the whole job.
+          python-version: "3.10"
 
       - uses: actions/setup-java@v4
         with:
@@ -43,6 +46,48 @@ jobs:
         run: |
           git clone --depth 1 --branch "${{ inputs.webhtv_ref || 'main' }}" \
             https://github.com/Silent1566/webhtv.git /tmp/webhtv
+
+      - name: Install the NDK
+        run: |
+          # The dv5 module is compiled from the checkout's CMake target, which needs an NDK.
+          # Take the version the host itself declares rather than guessing, so the module keeps
+          # being built with the same toolchain the app uses.
+          version=$(grep -oP 'ndkVersion\s+"\K[^"]+' /tmp/webhtv/app/build.gradle)
+          if [ -z "$version" ]; then
+            echo "could not read ndkVersion from the WebHTV checkout" >&2
+            exit 1
+          fi
+          echo "installing NDK $version (declared by the checkout)"
+          sdkmanager --install "ndk;$version"
+
+      - name: Build the payloads only Gradle produces
+        working-directory: /tmp/webhtv
+        run: |
+          # Two modules take their payload from build output rather than from tracked files:
+          #
+          #   python - Chaquopy's stdlib/requirements tree plus its eight libraries; produced by
+          #            the Chaquopy Gradle plugin, which uses the interpreter set up above.
+          #   dv5    - built by the packaging script itself, needing the NDK installed above.
+          #
+          # So the python half has to exist before packaging runs. The task list is deliberately
+          # minimal: assembling the app would additionally need signing and take far longer.
+          # Verified locally to produce all 28 payload files per ABI (8 libraries, 20 assets).
+          #
+          # PYTHONHASHSEED pins the hash seed Chaquopy's ``python -m compileall`` runs with.
+          # Without it CPython randomizes the seed per process, which reorders the frozenset
+          # constants that the peephole optimizer folds out of ``x in {...}``, so the bytecode
+          # differs on every build. Measured: twelve .pyc files differed between two builds of
+          # identical sources, and with the seed pinned two builds produced byte-identical
+          # bytecode. Environment variables propagate from Gradle to the tasks it spawns, so
+          # setting it here is enough - no Chaquopy option exists for it.
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_SDK_ROOT
+          chaquopyBuildPython=$(which python)
+          EOF
+          export PYTHONHASHSEED=0
+          ./gradlew --no-daemon \
+            :chaquo:mergeArm64_v8aDebugAssets :chaquo:copyArm64_v8aDebugJniLibsProjectOnly \
+            :chaquo:mergeArmeabi_v7aDebugAssets :chaquo:copyArmeabi_v7aDebugJniLibsProjectOnly
 
       - name: Use the Android debug keystore
         run: |
